@@ -52,18 +52,4 @@ All of these use arith::CmpIOp for integer comparison
 - label - MLIR Basic Block
 
 ### SSA
-- phi
-
-## Notes
-fib_recursive, fact, rot13 run without crashing.
-
-```bash
-bryant@dhcp-vl2041-45753 mlir % bril2json < ../../../benchmarks/core/hanoi.bril | python ../../ssa-old/to_ssa.py | ../build/bin/brilc -emit=mlir
-zsh: done                bril2json < ../../../benchmarks/core/hanoi.bril | python ../../ssa-old/to_ssa.py | 
-zsh: segmentation fault  ../build/bin/brilc -emit=mlir
-bryant@dhcp-vl2041-45753 mlir % bril2json < ../../../benchmarks/core/hamming.bril | python ../../ssa-old/to_ssa.py | ../build/bin/brilc -emit=mlir
-brilc(92569,0x1fa8ecc80) malloc: *** error for object 0x12c710300: pointer being freed was not allocated
-brilc(92569,0x1fa8ecc80) malloc: *** set a breakpoint in malloc_error_break to debug
-zsh: done       bril2json < ../../../benchmarks/core/hamming.bril | python ../../ssa-old/to_ssa.py | 
-zsh: abort      ../build/bin/brilc -emit=mlir
-```
+- phi (uses MLIR basic block arguments)
