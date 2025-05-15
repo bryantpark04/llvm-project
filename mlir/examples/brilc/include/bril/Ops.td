@@ -72,11 +72,10 @@ def PrintOp : Bril_Op<"print", [MemoryEffects<[MemWrite]>]> {
     Prints a value to standard output.
     ```
   }];
-  
-  let arguments = (ins AnyType:$value);
+  let arguments = (ins Variadic<AnyType>:$value);
   let results = (outs);
-  
   let assemblyFormat = "$value attr-dict `:` type($value)";
 }
+
 
 #endif // BRIL_OPS

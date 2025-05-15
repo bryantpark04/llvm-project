@@ -404,14 +404,21 @@ private:
     return mlir::success();
   }
 
-  llvm::LogicalResult mlirGenInstrPrint(json& instr, mlir::Location loc, mlir::Value value){
-    // TODO: support printing multiple values???
-    if (!value)
-      return mlir::failure();
-    
-    builder.create<mlir::bril::PrintOp>(loc, value);
+  llvm::LogicalResult mlirGenInstrPrint(json& instr, mlir::Location loc, llvm::DenseMap<std::string, mlir::Value> &symTab) {
+    llvm::SmallVector<mlir::Value, 4> values;
+    for (const auto& name : instr["args"]) {
+      auto it = symTab.find(name);
+      if (it == symTab.end() || !it->second) {
+        std::cerr << "Error: Undefined variable used in print: " << name << std::endl;
+        return mlir::failure();
+      }
+      values.push_back(it->second);
+    }
+  
+    builder.create<mlir::bril::PrintOp>(loc, values);
     return mlir::success();
   }
+  
 
   llvm::LogicalResult mlirGenInstrConst(json& instr, mlir::Location loc, llvm::DenseMap<std::string, mlir::Value> &symTab, std::string dest, std::string type){
     if (type == "int") {
@@ -515,8 +522,7 @@ private:
     }
 
     if (op == "print") {
-      auto value = get(instr["args"][0]);
-      return mlirGenInstrPrint(instr, loc, value);
+      return mlirGenInstrPrint(instr, loc, symTab);
     }
 
     if (op == "const") {

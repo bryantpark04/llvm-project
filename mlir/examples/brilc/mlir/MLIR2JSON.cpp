@@ -336,7 +336,10 @@ json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<m
   }
   else if (auto printOp = dyn_cast<mlir::bril::PrintOp>(&op)) {
     instr["op"] = "print";
-    instr["args"] = {getValueName(printOp.getValue())};
+    instr["args"] = json::array();
+    for (auto value : printOp.getOperands()) {
+      instr["args"].push_back(getValueName(value));
+    }
   }
   else if (auto nopOp = dyn_cast<mlir::bril::Nop>(&op)) {
     instr["op"] = "nop";
