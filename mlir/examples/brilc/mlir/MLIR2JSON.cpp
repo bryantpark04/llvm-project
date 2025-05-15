@@ -4,12 +4,15 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/IR/Operation.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SetVector.h"
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -28,41 +31,45 @@ public:
 
 private:
   json convertFunction(mlir::func::FuncOp funcOp);
-  json convertBlock(mlir::Block &block, std::string blockName, llvm::DenseMap<mlir::Block*, std::string> blockNames);
-  json convertOperation(mlir::Operation &op, llvm::DenseMap<mlir::Block*, std::string> blockNames);
+  json convertBlock(mlir::Block &block, llvm::DenseMap<mlir::Block*, std::string> &blockNames);
+  json convertOperation(mlir::Operation &op, llvm::DenseMap<mlir::Block*, std::string> &blockNames);
+  
+  void analyzeControlFlow(mlir::func::FuncOp funcOp);
+  void gatherPhiValues(mlir::func::FuncOp funcOp);
+  void generatePhiNodes(mlir::Block &block, json &instrs, llvm::DenseMap<mlir::Block*, std::string> &blockNames);
 
   llvm::DenseMap<mlir::Value, std::string> valueToName;
-  
-  
   int nextVarId = 0;
-  
   std::string getValueName(mlir::Value value);
-  
   std::string getTypeString(mlir::Type type);
   
-  std::string currentBlockName;
-  
-  void handleBlockArguments(mlir::Block &block, json &instrs, std::string blockName);
-  
-  struct PhiNode {
-    std::string dest;
-    std::vector<std::string> args;
-    std::vector<std::string> labels;
-    std::string type;
+  struct CFGNode {
+    mlir::Block* block = nullptr;
+    llvm::SmallVector<mlir::Block*, 4> predecessors;
+    llvm::SmallVector<mlir::Block*, 4> successors;
   };
   
-  llvm::DenseMap<mlir::Block*, std::vector<PhiNode>> blockPhiNodes;
+  llvm::DenseMap<mlir::Block*, CFGNode> cfgNodes;
   
-  llvm::DenseMap<mlir::Block*, std::vector<mlir::Block*>> blockPredecessors;
+  // BlockArg -> (Predecessor -> Value)
+  llvm::DenseMap<mlir::Value, llvm::DenseMap<mlir::Block*, mlir::Value>> phiValues;
   
-  using BlockArgMap = llvm::DenseMap<mlir::Block*, std::string>;
-  llvm::DenseMap<mlir::Value, BlockArgMap> phiValueSources;
+  llvm::DenseMap<mlir::Block*, std::string> currentBlockNames;
 };
 
 std::string MLIRToJSONConverter::getValueName(mlir::Value value) {
   auto it = valueToName.find(value);
   if (it != valueToName.end()) {
     return it->second;
+  }
+  
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    if (blockArg.getOwner()->isEntryBlock() && 
+        isa<mlir::func::FuncOp>(blockArg.getOwner()->getParentOp())) {
+      std::string name = "arg" + std::to_string(blockArg.getArgNumber());
+      valueToName[value] = name;
+      return name;
+    }
   }
   
   std::string name = "v" + std::to_string(nextVarId++);
@@ -83,48 +90,128 @@ std::string MLIRToJSONConverter::getTypeString(mlir::Type type) {
   return "int";
 }
 
-void MLIRToJSONConverter::handleBlockArguments(mlir::Block &block, json &instrs, std::string blockName) {
-  for (auto arg : block.getArguments()) {
-    auto it = phiValueSources.find(arg);
-    if (it != phiValueSources.end()) {
-      PhiNode phi;
-      phi.dest = getValueName(arg);
-      phi.type = getTypeString(arg.getType());
+void MLIRToJSONConverter::analyzeControlFlow(mlir::func::FuncOp funcOp) {
+  cfgNodes.clear();
+  
+  for (auto &block : funcOp.getBody()) {
+    CFGNode &node = cfgNodes[&block];
+    node.block = &block;
+  }
+  
+  for (auto &block : funcOp.getBody()) {
+    if (block.empty()) continue;
+    
+    Operation &terminator = block.back();
+    
+    if (auto brOp = dyn_cast<mlir::cf::BranchOp>(&terminator)) {
+      mlir::Block *dest = brOp.getDest();
+      cfgNodes[&block].successors.push_back(dest);
+      cfgNodes[dest].predecessors.push_back(&block);
+    }
+    else if (auto condBrOp = dyn_cast<mlir::cf::CondBranchOp>(&terminator)) {
+      mlir::Block *trueDest = condBrOp.getTrueDest();
+      mlir::Block *falseDest = condBrOp.getFalseDest();
       
-      for (auto &pred : it->second) {
-        std::string predName = blockName;
-        std::string argName = pred.second;
-        
-        phi.labels.push_back(predName);
-        phi.args.push_back(argName);
+      cfgNodes[&block].successors.push_back(trueDest);
+      cfgNodes[&block].successors.push_back(falseDest);
+      
+      cfgNodes[trueDest].predecessors.push_back(&block);
+      cfgNodes[falseDest].predecessors.push_back(&block);
+    }
+  }
+}
+
+void MLIRToJSONConverter::gatherPhiValues(mlir::func::FuncOp funcOp) {
+  phiValues.clear();
+  
+  for (auto &block : funcOp.getBody()) {
+    if (block.empty()) continue;
+    
+    Operation &terminator = block.back();
+    
+    if (auto brOp = dyn_cast<mlir::cf::BranchOp>(&terminator)) {
+      mlir::Block *dest = brOp.getDest();
+      
+      for (unsigned i = 0; i < brOp.getNumOperands(); ++i) {
+        if (i < dest->getNumArguments()) {
+          mlir::Value destArg = dest->getArgument(i);
+          mlir::Value sourceVal = brOp.getOperand(i);
+          phiValues[destArg][&block] = sourceVal;
+        }
+      }
+    }
+    else if (auto condBrOp = dyn_cast<mlir::cf::CondBranchOp>(&terminator)) {
+      mlir::Block *trueDest = condBrOp.getTrueDest();
+      for (unsigned i = 0; i < condBrOp.getNumTrueOperands(); ++i) {
+        if (i < trueDest->getNumArguments()) {
+          mlir::Value destArg = trueDest->getArgument(i);
+          mlir::Value sourceVal = condBrOp.getTrueOperand(i);
+          phiValues[destArg][&block] = sourceVal;
+        }
       }
       
-      json phiInstr;
-      phiInstr["op"] = "phi";
-      phiInstr["dest"] = phi.dest;
-      phiInstr["type"] = phi.type;
-      phiInstr["args"] = phi.args;
-      phiInstr["labels"] = phi.labels;
-      
-      instrs.push_back(phiInstr);
+      mlir::Block *falseDest = condBrOp.getFalseDest();
+      for (unsigned i = 0; i < condBrOp.getNumFalseOperands(); ++i) {
+        if (i < falseDest->getNumArguments()) {
+          mlir::Value destArg = falseDest->getArgument(i);
+          mlir::Value sourceVal = condBrOp.getFalseOperand(i);
+          phiValues[destArg][&block] = sourceVal;
+        }
+      }
     }
-    else {
-      std::string name = getValueName(arg);
-      std::string type = getTypeString(arg.getType());
+  }
+}
+
+void MLIRToJSONConverter::generatePhiNodes(mlir::Block &block, json &instrs, 
+                                           llvm::DenseMap<mlir::Block*, std::string> &blockNames) {
+  for (auto arg : block.getArguments()) {
+    json phiInstr;
+    phiInstr["op"] = "phi";
+    phiInstr["dest"] = getValueName(arg);
+    phiInstr["type"] = getTypeString(arg.getType());
+    
+    auto it = phiValues.find(arg);
+    if (it != phiValues.end()) {
+      std::vector<std::string> argNames;
+      std::vector<std::string> labelNames;
+
+      auto &node = cfgNodes[&block];
+      for (auto *pred : node.predecessors) {
+        std::string predName = blockNames[pred];
+        
+        auto predValIt = it->second.find(pred);
+        if (predValIt != it->second.end()) {
+          argNames.push_back(getValueName(predValIt->second));
+          labelNames.push_back(predName);
+        } else {
+          if (arg.getArgNumber() < block.getParent()->getArguments().size()) {
+            mlir::Value funcArg = block.getParent()->getArgument(arg.getArgNumber());
+            argNames.push_back(getValueName(funcArg));
+          } else {
+            argNames.push_back("__undefined");
+          }
+          labelNames.push_back(predName);
+        }
+      }
       
-      json phiInstr;
-      phiInstr["op"] = "phi";
-      phiInstr["dest"] = name;
-      phiInstr["type"] = type;
+      if (!argNames.empty()) {
+        phiInstr["args"] = argNames;
+        phiInstr["labels"] = labelNames;
+        instrs.push_back(phiInstr);
+      } else if (block.isEntryBlock()) {
+        phiInstr["args"] = json::array();
+        phiInstr["labels"] = json::array();
+        instrs.push_back(phiInstr);
+      }
+    } else if (block.isEntryBlock()) {
       phiInstr["args"] = json::array();
       phiInstr["labels"] = json::array();
-      
       instrs.push_back(phiInstr);
     }
   }
 }
 
-json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<mlir::Block*, std::string> blockNames) {
+json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<mlir::Block*, std::string> &blockNames) {
   json instr;
   
   if (auto constOp = dyn_cast<mlir::arith::ConstantIntOp>(&op)) {
@@ -132,23 +219,23 @@ json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<m
     instr["dest"] = getValueName(constOp->getResult(0));
     instr["type"] = getTypeString(constOp->getResult(0).getType());
     
-          if (constOp->getResult(0).getType().isInteger(1)) {
-        auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
-        if (intAttr) {
-          bool boolValue = intAttr.getInt() != 0;
-          instr["value"] = boolValue ? "true" : "false";
-        } else {
-          instr["value"] = "false";
-        }
+    if (constOp->getResult(0).getType().isInteger(1)) {
+      auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+      if (intAttr) {
+        bool boolValue = intAttr.getInt() != 0;
+        instr["value"] = boolValue;
       } else {
-        auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
-        if (intAttr) {
-          int64_t intValue = intAttr.getInt();
-          instr["value"] = intValue;
-        } else {
-          instr["value"] = 0;
-        }
+        instr["value"] = false;
       }
+    } else {
+      auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+      if (intAttr) {
+        int64_t intValue = intAttr.getInt();
+        instr["value"] = intValue;
+      } else {
+        instr["value"] = 0;
+      }
+    }
   }
   else if (auto addOp = dyn_cast<mlir::arith::AddIOp>(&op)) {
     instr["op"] = "add";
@@ -256,62 +343,20 @@ json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<m
   }
   else if (auto brOp = dyn_cast<mlir::cf::BranchOp>(&op)) {
     instr["op"] = "jmp";
-    // Get a unique identifier for the destination block
     mlir::Block *destBlock = brOp.getDest();
-    // We'll replace this with actual labels in convertFunction
-    // int blockIndex = std::distance(&destBlock->getParent()->front(), destBlock);
     instr["labels"] = { blockNames[destBlock] };
-
-    
-    if (brOp.getNumOperands() > 0) {
-      mlir::Block *destBlock = brOp.getDest();
-      for (unsigned i = 0; i < brOp.getNumOperands(); i++) {
-        mlir::Value arg = brOp.getOperand(i);
-        mlir::Value blockArg = destBlock->getArgument(i);
-        std::string argName = getValueName(arg);
-        
-        phiValueSources[blockArg][op.getBlock()] = argName;
-      }
-    }
   }
   else if (auto condBrOp = dyn_cast<mlir::cf::CondBranchOp>(&op)) {
     instr["op"] = "br";
     instr["args"] = {getValueName(condBrOp.getCondition())};
     
-    // Get unique identifiers for destination blocks
     mlir::Block *trueBlock = condBrOp.getTrueDest();
     mlir::Block *falseBlock = condBrOp.getFalseDest();
-    
-    // Calculate block indices
-    // int trueBlockIndex = std::distance(&trueBlock->getParent()->front(), trueBlock);
-    // int falseBlockIndex = std::distance(&falseBlock->getParent()->front(), falseBlock);
     
     instr["labels"] = {
       blockNames[trueBlock],
       blockNames[falseBlock]
-    }; 
-    
-    if (condBrOp.getNumTrueOperands() > 0) {
-      mlir::Block *trueBlock = condBrOp.getTrueDest();
-      for (unsigned i = 0; i < condBrOp.getNumTrueOperands(); i++) {
-        mlir::Value arg = condBrOp.getTrueOperand(i);
-        mlir::Value blockArg = trueBlock->getArgument(i);
-        std::string argName = getValueName(arg);
-        
-        phiValueSources[blockArg][op.getBlock()] = argName;
-      }
-    }
-    
-    if (condBrOp.getNumFalseOperands() > 0) {
-      mlir::Block *falseBlock = condBrOp.getFalseDest();
-      for (unsigned i = 0; i < condBrOp.getNumFalseOperands(); i++) {
-        mlir::Value arg = condBrOp.getFalseOperand(i);
-        mlir::Value blockArg = falseBlock->getArgument(i);
-        std::string argName = getValueName(arg);
-        
-        phiValueSources[blockArg][op.getBlock()] = argName;
-      }
-    }
+    };
   }
   else if (auto returnOp = dyn_cast<mlir::func::ReturnOp>(&op)) {
     instr["op"] = "ret";
@@ -347,16 +392,16 @@ json MLIRToJSONConverter::convertOperation(mlir::Operation &op, llvm::DenseMap<m
   return instr;
 }
 
-json MLIRToJSONConverter::convertBlock(mlir::Block &block, std::string blockName, llvm::DenseMap<mlir::Block*, std::string> blockNames) {
+json MLIRToJSONConverter::convertBlock(mlir::Block &block, llvm::DenseMap<mlir::Block*, std::string> &blockNames) {
   json instrs = json::array();
   
-  if (blockName != "entry") {
+  if (!block.isEntryBlock()) {
     json labelInstr;
-    labelInstr["label"] = blockName;
+    labelInstr["label"] = blockNames[&block];
     instrs.push_back(labelInstr);
   }
 
-  handleBlockArguments(block, instrs, blockName);
+  generatePhiNodes(block, instrs, blockNames);
   
   for (auto &op : block) {
     if (op.hasTrait<mlir::OpTrait::IsTerminator>()) {
@@ -385,50 +430,39 @@ json MLIRToJSONConverter::convertFunction(mlir::func::FuncOp funcOp) {
   json func;
   func["name"] = funcOp.getName().str();
   
-  llvm::DenseMap<mlir::Block*, std::string> blockNames;
-  llvm::StringMap<int> nameCount;
+  valueToName.clear();
+  nextVarId = 0;
   
-  blockNames[&funcOp.getBody().front()] = "entry";
+  analyzeControlFlow(funcOp);
+  
+  gatherPhiValues(funcOp);
+  
+  llvm::DenseMap<mlir::Block*, std::string> blockNames;
+  
+  blockNames[&funcOp.getBody().front()] = ".b1";
   
   int blockId = 0;
   for (auto &block : funcOp.getBody()) {
     if (&block != &funcOp.getBody().front()) {
-      std::string name = "block" + std::to_string(blockId++);
-      blockNames[&block] = name;
+      blockNames[&block] = ".block" + std::to_string(blockId++);
     }
   }
   
-  for (auto &block : funcOp.getBody()) {
-    for (auto &op : block) {
-      if (auto brOp = dyn_cast<mlir::cf::BranchOp>(&op)) {
-        mlir::Block *dest = brOp.getDest();
-        blockPredecessors[dest].push_back(&block);
-      }
-      else if (auto condBrOp = dyn_cast<mlir::cf::CondBranchOp>(&op)) {
-        mlir::Block *trueDest = condBrOp.getTrueDest();
-        mlir::Block *falseDest = condBrOp.getFalseDest();
-        blockPredecessors[trueDest].push_back(&block);
-        blockPredecessors[falseDest].push_back(&block);
-      }
-    }
-  }
+  currentBlockNames = blockNames;
   
   json args = json::array();
   for (auto arg : funcOp.getArguments()) {
     json argObj;
     argObj["name"] = getValueName(arg);
-    // std::cout << getTypeString(arg.getType()) << std::endl;
     argObj["type"] = getTypeString(arg.getType());
     args.push_back(argObj);
   }
   func["args"] = args;
   
   json allInstrs = json::array();
+  
   for (auto &block : funcOp.getBody()) {
-    std::string blockName = blockNames[&block];
-    currentBlockName = blockName;
-    
-    json blockInstrs = convertBlock(block, blockName, blockNames);
+    json blockInstrs = convertBlock(block, blockNames);
     for (auto &instr : blockInstrs) {
       allInstrs.push_back(instr);
     }
@@ -438,18 +472,6 @@ json MLIRToJSONConverter::convertFunction(mlir::func::FuncOp funcOp) {
   if (fnType.getNumResults() > 0) {
     func["type"] = getTypeString(fnType.getResult(0));
   }
-  
-  // for (auto &instr : allInstrs) {
-  //   if (instr.contains("op") && (instr["op"] == "jmp" || instr["op"] == "br") && instr.contains("labels")) {
-  //     json newLabels = json::array();
-  //     for (auto &labelIdx : instr["labels"]) {
-  //       std::cout << "STOI WITH LABEL IDX: " << labelIdx.get<std::string>() << std::endl;
-  //       // int idx = std::stoi(labelIdx.get<std::string>());
-  //       newLabels.push_back(labelIdx.get<std::string>());
-  //     }
-  //     instr["labels"] = newLabels;
-  //   }
-  // }
   
   func["instrs"] = allInstrs;
   return func;
@@ -467,7 +489,7 @@ json MLIRToJSONConverter::convertModule(mlir::ModuleOp module) {
   return j;
 }
 
-} 
+} // namespace
 
 namespace bril {
 
