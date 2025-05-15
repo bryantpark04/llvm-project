@@ -49,7 +49,6 @@ using llvm::Twine;
 
 using json = nlohmann::json;
 
-// print json for debugging
 void dbg(json& j) {
   if (true) {
     std::cout << j.dump(2) << std::endl;
@@ -88,7 +87,6 @@ public:
   mlir::ModuleOp mlirGen(json &j) {
     brilModule = mlir::ModuleOp::create(builder.getUnknownLoc());
 
-    // generate MLIR for each function
     for (auto &f : j["functions"]) {
       if (failed(mlirGenFunction(f))) {
         brilModule.emitError("error generating function");
@@ -96,7 +94,6 @@ public:
       }
     }
 
-    // verify program
     if (failed(mlir::verify(brilModule))) {
       brilModule.emitError("module verification error");
       return nullptr;
@@ -109,7 +106,6 @@ private:
   mlir::ModuleOp brilModule;
   mlir::OpBuilder builder;
 
-  // convert bril types into MLIR types
   mlir::Type getBrilType(const std::string &typeStr) {
     if (typeStr == "int") return builder.getI32Type();
     if (typeStr == "bool") return builder.getI1Type();
@@ -117,7 +113,6 @@ private:
     return nullptr;
   }
 
-  // store phi node data
   struct PhiInfo {
     std::string dest;
     std::vector<std::string> args;
@@ -125,15 +120,12 @@ private:
     std::string type;
   };
 
-  // generate MLIR for a function and add to module
   llvm::LogicalResult mlirGenFunction(json &func) {
-    // reset builder
     builder.clearInsertionPoint();
     auto loc = builder.getUnknownLoc();
     
     std::string name = func["name"];
 
-    // get function arg types
     llvm::SmallVector<mlir::Type, 4> argTypes;
     for(auto& arg : func["args"]){
       std::string typeStr = arg["type"];
@@ -145,28 +137,28 @@ private:
       argTypes.push_back(type);
     }
 
-    // get return type
-    std::optional<llvm::SmallVector<mlir::Type, 1>> returnType;
-    if(func.contains("type")){
+    llvm::SmallVector<mlir::Type, 1> resultTypes;
+    if (func.contains("type")) {
       std::string typeStr = func["type"];
       auto type = getBrilType(typeStr);
-      returnType->push_back(type);
+      if (!type) {
+        brilModule.emitError("Unknown return type: ") << typeStr;
+        return mlir::failure();
+      }
+      resultTypes.push_back(type);
     }
 
-    // create function type
-    auto funcType = builder.getFunctionType(argTypes, *returnType);
+    auto funcType = builder.getFunctionType(argTypes, resultTypes);
+
     auto function = builder.create<mlir::func::FuncOp>(loc, name, funcType);
     brilModule.push_back(function);
     
-    // create blocks and collect phis
     llvm::DenseMap<std::string, mlir::Block*> labelToBlock;
     llvm::DenseMap<std::string, std::vector<PhiInfo>> blockPhis;
 
-    // set entry block
     mlir::Block *entry = function.addEntryBlock();
     labelToBlock[name + "_entry"] = entry;
 
-    // collect phis
     for (auto &instr : func["instrs"]) {
       if (instr.contains("label")) {
         std::string label = instr["label"];
@@ -176,7 +168,6 @@ private:
       } else if (instr.contains("op") && instr["op"] == "phi") {
         std::string blockLabel = name + "_entry";
         
-        // find block label for this phi
         for (auto it = &instr-1; it >= &func["instrs"][0]; it--) {
           if (it->contains("label")) {
             blockLabel = (*it)["label"];
@@ -184,7 +175,6 @@ private:
           }
         }
         
-        // store in PhiInfo
         PhiInfo phi;
         phi.dest = instr["dest"];
         phi.type = instr["type"];
@@ -195,55 +185,44 @@ private:
           phi.labels.push_back(label);
         }
         
-        // store in blockPhis
         blockPhis[blockLabel].push_back(phi);
       }
     }
 
-    // get block args
     for (const auto& pair : blockPhis) {
-      // get block and phi node data
       std::string blockLabel = pair.first;
       const std::vector<PhiInfo>& phis = pair.second;
       mlir::Block* block = labelToBlock[blockLabel];
       
-      // add args
       for (const auto& phi : phis) {
         mlir::Type argType = getBrilType(phi.type);
         block->addArgument(argType, loc);
       }
     }
 
-    // initial symbol table
     llvm::DenseMap<std::string, mlir::Value> symbolTable;
     for (size_t i = 0; i < func["args"].size(); ++i) {
       std::string argName = func["args"][i]["name"];
       symbolTable[argName] = entry->getArgument(i);
     }
 
-    // start at entry
     mlir::Block *curBlock = entry;
     builder.setInsertionPointToStart(entry);
 
-    // map phi dests to block args
     llvm::DenseMap<std::string, mlir::BlockArgument> phiDestToArg;
     
-    // iterate over and process instructions
     int blockArgIndex = 0;
     for (auto &instr : func["instrs"]) {
       // dbg(instr);
       if (instr.contains("label")) {
-        // find new block
         std::string label = instr["label"];
         curBlock = labelToBlock[label];
         builder.setInsertionPointToStart(curBlock);
         
-        // make sure block does not end up empty
         if (curBlock->empty()) {
           builder.create<Nop>(loc);
         }
         
-        // map block args
         blockArgIndex = 0;
         if (blockPhis.count(label) > 0) {
           for (const auto& phi : blockPhis[label]) {
@@ -264,12 +243,10 @@ private:
           std::string target = instr["labels"][0];
           mlir::Block* targetBlock = labelToBlock[target];
           
-          // check block args
           if (blockPhis.count(target) > 0) {
             llvm::SmallVector<mlir::Value, 4> blockArgs;
             
             for (const auto& phi : blockPhis[target]) {
-              // get label
               int labelIndex = -1;
               std::string currentLabel;
               for (const auto& [label, block] : labelToBlock) {
@@ -279,7 +256,6 @@ private:
                 }
               }
               
-              // find index in phi labels
               for (size_t i = 0; i < phi.labels.size(); i++) {
                 if (phi.labels[i] == currentLabel) {
                   labelIndex = i;
@@ -288,7 +264,6 @@ private:
               }
               
               if (labelIndex >= 0) {
-                // pass in phi arg
                 std::string argName = phi.args[labelIndex];
                 mlir::Value argValue = symbolTable[argName];
                 blockArgs.push_back(argValue);
@@ -298,19 +273,15 @@ private:
               }
             }
             
-            // create jump with phi args
             builder.create<BranchOp>(loc, targetBlock, blockArgs);
           } else {
-            // create jump with no phi args
             builder.create<BranchOp>(loc, targetBlock);
           }
         } else if (op == "br") {
-          // get fields
           auto cond = symbolTable[instr["args"][0]];
           std::string trueTarget = instr["labels"][0];
           std::string falseTarget = instr["labels"][1];
           
-          // find target blocks
           mlir::Block* trueBlock = labelToBlock[trueTarget];
           mlir::Block* falseBlock = labelToBlock[falseTarget];
 
@@ -345,7 +316,6 @@ private:
             }
           }
           
-          // get args for false
           llvm::SmallVector<mlir::Value, 4> falseBlockArgs;
           if (blockPhis.count(falseTarget) > 0) {
             std::string currentLabel;
@@ -375,7 +345,6 @@ private:
             }
           }
           
-          // create branch with block args
           builder.create<CondBranchOp>(loc, cond, trueBlock, trueBlockArgs, falseBlock, falseBlockArgs);
         } else if (failed(mlirGenInstr(instr, symbolTable, loc))) {
           std::cout << "failed on instruction " << instr.dump(2) << std::endl;
@@ -386,24 +355,19 @@ private:
 
     // make sure all blocks have terminator
     for (auto &block : function.getBody()) {
-      // skip if already has terminator
       if (!block.empty() && block.back().mightHaveTrait<mlir::OpTrait::IsTerminator>()) {
         continue;
       }
       
-      // insert terminator at end
       builder.setInsertionPointToEnd(&block);
       
       if (&block == &function.getBody().back()) {
-        // return if last block
         builder.create<mlir::func::ReturnOp>(loc);
       } else {
-        // branch to next block
         auto nextBlockIt = std::next(block.getIterator());
         if (nextBlockIt != function.getRegion().end()){
           mlir::Block *nextBlock = &(*nextBlockIt);
           
-          // get next block
           std::string nextBlockLabel;
           for (const auto& [label, block] : labelToBlock) {
             if (block == nextBlock) {
@@ -448,7 +412,6 @@ private:
         return mlir::success();
       }
 
-      // bool
       if(type == "bool"){
         bool value = instr["value"].get<bool>();
         auto constOp = builder.create<ConstantIntOp>(loc, value, 1);
@@ -533,29 +496,24 @@ private:
     std::string dest = instr.value("dest", "");
     std::string type = instr.value("type", "");
 
-    // lookup for var names
     auto get = [&](const std::string &name) -> mlir::Value {
       auto it = symTab.find(name);
       return it != symTab.end() ? it->second : nullptr;
     };
 
-    // nop
     if (op == "nop") {
       return mlirGenInstrNop(instr, loc);
     }
 
-    // print
     if (op == "print") {
       auto value = get(instr["args"][0]);
       return mlirGenInstrPrint(instr, loc, value);
     }
 
-    // const
     if (op == "const") {
       return mlirGenInstrConst(instr, loc, symTab, dest, type);
     }
 
-    // arithmetic binops
     if (op == "add" || op == "mul" || op == "sub" || op == "div") {
        auto lhs = get(args[0]);
        auto rhs = get(args[1]);
@@ -568,28 +526,23 @@ private:
       return mlirGenInstrComp(op, loc, symTab, dest, lhs, rhs);
     }
 
-    // logical binops
     if (op == "and" || op == "or") {
       auto lhs = get(args[0]);
       auto rhs = get(args[1]);
       return mlirGenInstrLogicBinop(op, loc, symTab, dest, lhs, rhs);
     }
     
-    // not
     if (op == "not") {
       auto arg = get(args[0]);
       return mlirGenInstrNot(loc, symTab, dest, arg);
     }
     
-    // id
     if (op == "id") {
       auto input = get(args[0]);
       return mlirGenInstrId(loc, symTab, dest, input);
     }
 
-    // function call
     if(op == "call"){
-      // get args
       llvm::SmallVector<mlir::Value, 4> operands;
       for(const auto& arg: args){
         operands.push_back(get(arg));
@@ -597,7 +550,6 @@ private:
 
       std::string funcName = instr["funcs"][0];
 
-      // get function return type
       llvm::SmallVector<mlir::Type, 1> resultTypes;
       if (instr.contains("dest")) {
         std::string typeName = instr["type"];
@@ -605,10 +557,8 @@ private:
         resultTypes.push_back(resultType);
       }
 
-      // create CallOp
       auto callOp = builder.create<mlir::func::CallOp>(loc, resultTypes, funcName, operands);
       
-      // assign if non-void
       if (instr.contains("dest")) {
         std::string destName = instr["dest"];
         mlir::Value result = callOp.getResult(0);
@@ -617,7 +567,6 @@ private:
       return mlir::success(); 
     }
 
-    // ret
     if(op == "ret"){
       llvm::SmallVector<mlir::Value> returnVals;
       for(const auto& arg: args){
@@ -630,7 +579,6 @@ private:
   }
 };
 
-// entry point
 mlir::OwningOpRef<mlir::ModuleOp> mlirGen(mlir::MLIRContext &context, json &j) {
   return mlir::OwningOpRef<mlir::ModuleOp>(
       MLIRGenImpl(context).mlirGen(j));
