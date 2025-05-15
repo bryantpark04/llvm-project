@@ -206,6 +206,15 @@ private:
       symbolTable[argName] = entry->getArgument(i);
     }
 
+    for (const auto& [blockLabel, phis] : blockPhis) {
+      mlir::Block* block = labelToBlock[blockLabel];
+      for (size_t i = 0; i < phis.size(); ++i) {
+        const auto& phi = phis[i];
+        mlir::BlockArgument arg = block->getArgument(i);
+        symbolTable[phi.dest] = arg;
+      }
+    }
+
     mlir::Block *curBlock = entry;
     builder.setInsertionPointToStart(entry);
 
